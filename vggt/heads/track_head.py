@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import torch.nn as nn
+from typing import List, Optional
 from .dpt_head import DPTHead
 from .track_modules.base_track_predictor import BaseTrackerPredictor
 
@@ -69,7 +70,15 @@ class TrackHead(nn.Module):
 
         self.iters = iters
 
-    def forward(self, aggregated_tokens_list, images, patch_start_idx, query_points=None, iters=None):
+    def forward(
+        self,
+        aggregated_tokens_list,
+        images,
+        patch_start_idx,
+        query_points=None,
+        iters=None,
+        layer_indices: Optional[List[int]] = None,
+    ):
         """
         Forward pass of the TrackHead.
 
@@ -92,7 +101,9 @@ class TrackHead(nn.Module):
 
         # Extract features from tokens
         # feature_maps has shape (B, S, C, H//2, W//2) due to down_ratio=2
-        feature_maps = self.feature_extractor(aggregated_tokens_list, images, patch_start_idx)
+        feature_maps = self.feature_extractor(
+            aggregated_tokens_list, images, patch_start_idx, layer_indices=layer_indices
+        )
 
         # Use default iterations if not specified
         if iters is None:

@@ -4,20 +4,38 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+import os
+from concurrent.futures import ThreadPoolExecutor
+
+import numpy as np
 import torch
 from PIL import Image
 from torchvision import transforms as TF
-import numpy as np
+
+try:
+    from tqdm.auto import tqdm
+except ImportError:
+    tqdm = None
 
 
-def load_and_preprocess_images_square(image_path_list, target_size=1024):
+def load_and_preprocess_images_square(
+    image_path_list,
+    target_size=1024,
+    *,
+    show_progress=False,
+    desc="Loading images",
+    num_workers=0,
+):
     """
     Load and preprocess images by center padding to square and resizing to target size.
     Also returns the position information of original pixels after transformation.
 
     Args:
         image_path_list (list): List of paths to image files
-        target_size (int, optional): Target size for both width and height. Defaults to 518.
+        target_size (int, optional): Target size for both width and height. Defaults to 1024.
+        show_progress (bool, optional): If True, display a tqdm progress bar during loading when available.
+        desc (str, optional): Description shown alongside the tqdm progress bar.
+        num_workers (int, optional): Number of worker threads for parallel image loading. 0 disables threading.
 
     Returns:
         tuple: (
@@ -36,50 +54,73 @@ def load_and_preprocess_images_square(image_path_list, target_size=1024):
     original_coords = []  # Renamed from position_info to be more descriptive
     to_tensor = TF.ToTensor()
 
-    for image_path in image_path_list:
-        # Open image
-        img = Image.open(image_path)
+    def _process_single(image_path):
+        # Open image and ensure it is closed promptly
+        with Image.open(image_path) as img:
+            # If there's an alpha channel, blend onto white background
+            if img.mode == "RGBA":
+                background = Image.new("RGBA", img.size, (255, 255, 255, 255))
+                img = Image.alpha_composite(background, img)
 
-        # If there's an alpha channel, blend onto white background
-        if img.mode == "RGBA":
-            background = Image.new("RGBA", img.size, (255, 255, 255, 255))
-            img = Image.alpha_composite(background, img)
+            # Convert to RGB
+            img = img.convert("RGB")
 
-        # Convert to RGB
-        img = img.convert("RGB")
+            # Get original dimensions
+            width, height = img.size
 
-        # Get original dimensions
-        width, height = img.size
+            # Make the image square by padding the shorter dimension
+            max_dim = max(width, height)
 
-        # Make the image square by padding the shorter dimension
-        max_dim = max(width, height)
+            # Calculate padding
+            left = (max_dim - width) // 2
+            top = (max_dim - height) // 2
 
-        # Calculate padding
-        left = (max_dim - width) // 2
-        top = (max_dim - height) // 2
+            # Calculate scale factor for resizing
+            scale = target_size / max_dim
 
-        # Calculate scale factor for resizing
-        scale = target_size / max_dim
+            # Calculate final coordinates of original image in target space
+            x1 = left * scale
+            y1 = top * scale
+            x2 = (left + width) * scale
+            y2 = (top + height) * scale
 
-        # Calculate final coordinates of original image in target space
-        x1 = left * scale
-        y1 = top * scale
-        x2 = (left + width) * scale
-        y2 = (top + height) * scale
+            # Create a new black square image and paste original
+            square_img = Image.new("RGB", (max_dim, max_dim), (0, 0, 0))
+            square_img.paste(img, (left, top))
 
-        # Store original image coordinates and scale
-        original_coords.append(np.array([x1, y1, x2, y2, width, height]))
+            # Resize to target size
+            square_img = square_img.resize((target_size, target_size), Image.Resampling.BICUBIC)
 
-        # Create a new black square image and paste original
-        square_img = Image.new("RGB", (max_dim, max_dim), (0, 0, 0))
-        square_img.paste(img, (left, top))
-
-        # Resize to target size
-        square_img = square_img.resize((target_size, target_size), Image.Resampling.BICUBIC)
-
-        # Convert to tensor
+        # Convert to tensor outside the context manager to minimise time image file is open
         img_tensor = to_tensor(square_img)
-        images.append(img_tensor)
+        coords = np.array([x1, y1, x2, y2, width, height])
+        return img_tensor, coords
+
+    use_threads = (num_workers or 0) > 1
+    if use_threads:
+        max_workers = num_workers
+        if max_workers is None or max_workers <= 0:
+            cpu_count = os.cpu_count() or 1
+            max_workers = min(8, cpu_count)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            iterator = executor.map(_process_single, image_path_list)
+            if show_progress and tqdm is not None:
+                iterator = tqdm(iterator, total=len(image_path_list), desc=desc)
+            elif show_progress:
+                print(desc)
+            for img_tensor, coords in iterator:
+                images.append(img_tensor)
+                original_coords.append(coords)
+    else:
+        iterable = image_path_list
+        if show_progress and tqdm is not None:
+            iterable = tqdm(iterable, total=len(image_path_list), desc=desc)
+        elif show_progress:
+            print(desc)
+        for image_path in iterable:
+            img_tensor, coords = _process_single(image_path)
+            images.append(img_tensor)
+            original_coords.append(coords)
 
     # Stack all images
     images = torch.stack(images)

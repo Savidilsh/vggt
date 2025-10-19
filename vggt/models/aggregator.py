@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
-from typing import Optional, Tuple, Union, List, Dict, Any
+from typing import Optional, Tuple, Union, List, Dict, Any, Callable
 
 from vggt.layers import PatchEmbed
 from vggt.layers.block import Block
@@ -71,6 +71,8 @@ class Aggregator(nn.Module):
     ):
         super().__init__()
 
+        self.num_register_tokens = num_register_tokens
+
         self.__build_patch_embed__(patch_embed, img_size, patch_size, num_register_tokens, embed_dim=embed_dim)
 
         # Initialize rotary position embedding if frequency > 0
@@ -115,6 +117,10 @@ class Aggregator(nn.Module):
         self.aa_order = aa_order
         self.patch_size = patch_size
         self.aa_block_size = aa_block_size
+        self.requested_output_layers: Optional[List[int]] = None
+        self._progress_callback: Optional[Callable[[int, int], None]] = None
+        self._progress_step: int = 0
+        self.progress_total: int = self.depth * len(self.aa_order)
 
         # Validate that depth is divisible by aa_block_size
         if self.depth % self.aa_block_size != 0:
@@ -127,16 +133,38 @@ class Aggregator(nn.Module):
         self.camera_token = nn.Parameter(torch.randn(1, 2, 1, embed_dim))
         self.register_token = nn.Parameter(torch.randn(1, 2, num_register_tokens, embed_dim))
 
+    def set_output_layers(self, layer_indices: Optional[Union[List[int], Tuple[int, ...]]]) -> None:
+        """
+        Restrict which transformer layers' outputs are retained.
+
+        Args:
+            layer_indices: Iterable of layer ids (0-based) that downstream heads require.
+                Pass None to keep all layers (default behaviour).
+        """
+        if layer_indices is None:
+            self.requested_output_layers = None
+            return
+
+        unique_sorted = sorted(set(layer_indices))
+        if any(idx < 0 or idx >= self.depth for idx in unique_sorted):
+            raise ValueError(
+                f"Requested output layers must be within [0, {self.depth - 1}], got {unique_sorted}"
+            )
+        self.requested_output_layers = unique_sorted
+
         # The patch tokens start after the camera and register tokens
-        self.patch_start_idx = 1 + num_register_tokens
+        self.patch_start_idx = 1 + self.num_register_tokens
 
         # Initialize parameters with small values
         nn.init.normal_(self.camera_token, std=1e-6)
         nn.init.normal_(self.register_token, std=1e-6)
 
         # Register normalization constants as buffers
+        device = self.camera_token.device
+        dtype = self.camera_token.dtype
         for name, value in (("_resnet_mean", _RESNET_MEAN), ("_resnet_std", _RESNET_STD)):
-            self.register_buffer(name, torch.FloatTensor(value).view(1, 1, 3, 1, 1), persistent=False)
+            tensor = torch.tensor(value, dtype=dtype, device=device).view(1, 1, 3, 1, 1)
+            self.register_buffer(name, tensor, persistent=False)
 
         self.use_reentrant = False # hardcoded to False
 
@@ -232,8 +260,10 @@ class Aggregator(nn.Module):
 
         frame_idx = 0
         global_idx = 0
-        output_list = []
-
+        output_list: List[torch.Tensor] = []
+        kept_indices: List[int] = []
+        requested_set = set(self.requested_output_layers) if self.requested_output_layers is not None else None
+        layer_counter = 0
         for _ in range(self.aa_block_num):
             for attn_type in self.aa_order:
                 if attn_type == "frame":
@@ -250,12 +280,22 @@ class Aggregator(nn.Module):
             for i in range(len(frame_intermediates)):
                 # concat frame and global intermediates, [B x S x P x 2C]
                 concat_inter = torch.cat([frame_intermediates[i], global_intermediates[i]], dim=-1)
-                output_list.append(concat_inter)
+                if requested_set is None or layer_counter in requested_set:
+                    output_list.append(concat_inter)
+                    kept_indices.append(layer_counter)
+                del concat_inter
+                layer_counter += 1
 
-        del concat_inter
         del frame_intermediates
         del global_intermediates
-        return output_list, self.patch_start_idx
+        return output_list, self.patch_start_idx, kept_indices
+
+    def set_progress_callback(self, callback: Optional[Callable[[int, int], None]]):
+        """
+        Set a callback which receives (completed_layers, total_layers) after each layer finishes.
+        """
+        self._progress_callback = callback
+        self._progress_step = 0
 
     def _process_frame_attention(self, tokens, B, S, P, C, frame_idx, pos=None):
         """
@@ -278,6 +318,13 @@ class Aggregator(nn.Module):
                 tokens = self.frame_blocks[frame_idx](tokens, pos=pos)
             frame_idx += 1
             intermediates.append(tokens.view(B, S, P, C))
+            if self._progress_callback is not None:
+                self._progress_step += 1
+                try:
+                    self._progress_callback(self._progress_step, self.progress_total)
+                except Exception as exc:  # pragma: no cover
+                    logger.debug("Aggregator progress callback failed: %s", exc)
+                    self._progress_callback = None
 
         return tokens, frame_idx, intermediates
 
@@ -301,6 +348,13 @@ class Aggregator(nn.Module):
                 tokens = self.global_blocks[global_idx](tokens, pos=pos)
             global_idx += 1
             intermediates.append(tokens.view(B, S, P, C))
+            if self._progress_callback is not None:
+                self._progress_step += 1
+                try:
+                    self._progress_callback(self._progress_step, self.progress_total)
+                except Exception as exc:  # pragma: no cover
+                    logger.debug("Aggregator progress callback failed: %s", exc)
+                    self._progress_callback = None
 
         return tokens, global_idx, intermediates
 

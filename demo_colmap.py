@@ -74,14 +74,16 @@ def run_VGGT(model, images, dtype, resolution=518):
     with torch.no_grad():
         with torch.cuda.amp.autocast(dtype=dtype):
             images = images[None]  # add batch dimension
-            aggregated_tokens_list, ps_idx = model.aggregator(images)
+            aggregated_tokens_list, ps_idx, layer_indices = model.aggregator(images)
 
         # Predict Cameras
-        pose_enc = model.camera_head(aggregated_tokens_list)[-1]
+        pose_enc = model.camera_head(aggregated_tokens_list, layer_indices=layer_indices)[-1]
         # Extrinsic and intrinsic matrices, following OpenCV convention (camera from world)
         extrinsic, intrinsic = pose_encoding_to_extri_intri(pose_enc, images.shape[-2:])
         # Predict Depth Maps
-        depth_map, depth_conf = model.depth_head(aggregated_tokens_list, images, ps_idx)
+        depth_map, depth_conf = model.depth_head(
+            aggregated_tokens_list, images, ps_idx, layer_indices=layer_indices
+        )
 
     extrinsic = extrinsic.squeeze(0).cpu().numpy()
     intrinsic = intrinsic.squeeze(0).cpu().numpy()
@@ -115,6 +117,16 @@ def demo_fn(args):
     model.load_state_dict(torch.hub.load_state_dict_from_url(_URL))
     model.eval()
     model = model.to(device)
+    required_layers = {model.aggregator.depth - 1}
+    if model.depth_head is not None:
+        required_layers.update(model.depth_head.intermediate_layer_idx)
+    point_head = getattr(model, "point_head", None)
+    if point_head is not None:
+        required_layers.update(point_head.intermediate_layer_idx)
+    track_head = getattr(model, "track_head", None)
+    if track_head is not None:
+        required_layers.update(track_head.feature_extractor.intermediate_layer_idx)
+    model.aggregator.set_output_layers(sorted(required_layers))
     print(f"Model loaded")
 
     # Get image paths and preprocess them

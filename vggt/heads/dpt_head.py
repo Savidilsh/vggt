@@ -9,7 +9,7 @@
 
 
 import os
-from typing import List, Dict, Tuple, Union
+from typing import List, Dict, Tuple, Union, Optional
 
 import torch
 import torch.nn as nn
@@ -118,6 +118,7 @@ class DPTHead(nn.Module):
         images: torch.Tensor,
         patch_start_idx: int,
         frames_chunk_size: int = 8,
+        layer_indices: Optional[List[int]] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Forward pass through the DPT head, supports processing by chunking frames.
@@ -136,9 +137,11 @@ class DPTHead(nn.Module):
         """
         B, S, _, H, W = images.shape
 
+        layer_map = self._build_layer_map(aggregated_tokens_list, layer_indices)
+
         # If frames_chunk_size is not specified or greater than S, process all frames at once
         if frames_chunk_size is None or frames_chunk_size >= S:
-            return self._forward_impl(aggregated_tokens_list, images, patch_start_idx)
+            return self._forward_impl(aggregated_tokens_list, images, patch_start_idx, layer_map=layer_map)
 
         # Otherwise, process frames in chunks to manage memory usage
         assert frames_chunk_size > 0
@@ -153,12 +156,22 @@ class DPTHead(nn.Module):
             # Process batch of frames
             if self.feature_only:
                 chunk_output = self._forward_impl(
-                    aggregated_tokens_list, images, patch_start_idx, frames_start_idx, frames_end_idx
+                    aggregated_tokens_list,
+                    images,
+                    patch_start_idx,
+                    frames_start_idx,
+                    frames_end_idx,
+                    layer_map=layer_map,
                 )
                 all_preds.append(chunk_output)
             else:
                 chunk_preds, chunk_conf = self._forward_impl(
-                    aggregated_tokens_list, images, patch_start_idx, frames_start_idx, frames_end_idx
+                    aggregated_tokens_list,
+                    images,
+                    patch_start_idx,
+                    frames_start_idx,
+                    frames_end_idx,
+                    layer_map=layer_map,
                 )
                 all_preds.append(chunk_preds)
                 all_conf.append(chunk_conf)
@@ -169,6 +182,32 @@ class DPTHead(nn.Module):
         else:
             return torch.cat(all_preds, dim=1), torch.cat(all_conf, dim=1)
 
+    def _build_layer_map(
+        self,
+        aggregated_tokens_list: List[torch.Tensor],
+        layer_indices: Optional[List[int]],
+    ) -> Dict[int, int]:
+        """
+        Build a mapping from original transformer layer ids to positions inside the provided list.
+        """
+        if layer_indices is None:
+            return {idx: idx for idx in range(len(aggregated_tokens_list))}
+
+        if len(layer_indices) != len(aggregated_tokens_list):
+            raise ValueError(
+                "Mismatch between provided layer indices and aggregated token list length "
+                f"({len(layer_indices)} vs {len(aggregated_tokens_list)})."
+            )
+
+        mapping = {orig_idx: pos for pos, orig_idx in enumerate(layer_indices)}
+        missing = [idx for idx in self.intermediate_layer_idx if idx not in mapping]
+        if missing:
+            raise ValueError(
+                "Aggregator did not return all layers required by DPTHead. "
+                f"Missing layers: {missing}. Please call set_output_layers with these indices."
+            )
+        return mapping
+
     def _forward_impl(
         self,
         aggregated_tokens_list: List[torch.Tensor],
@@ -176,6 +215,7 @@ class DPTHead(nn.Module):
         patch_start_idx: int,
         frames_start_idx: int = None,
         frames_end_idx: int = None,
+        layer_map: Optional[Dict[int, int]] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Implementation of the forward pass through the DPT head.
@@ -202,8 +242,17 @@ class DPTHead(nn.Module):
         out = []
         dpt_idx = 0
 
+        if layer_map is None:
+            layer_map = {idx: idx for idx in range(len(aggregated_tokens_list))}
+
         for layer_idx in self.intermediate_layer_idx:
-            x = aggregated_tokens_list[layer_idx][:, :, patch_start_idx:]
+            if layer_idx not in layer_map:
+                raise ValueError(
+                    f"Layer {layer_idx} not present in aggregated tokens. "
+                    "Ensure the aggregator is configured with set_output_layers()."
+                )
+            mapped_idx = layer_map[layer_idx]
+            x = aggregated_tokens_list[mapped_idx][:, :, patch_start_idx:]
 
             # Select frames if processing a chunk
             if frames_start_idx is not None and frames_end_idx is not None:

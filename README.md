@@ -107,18 +107,18 @@ from vggt.utils.geometry import unproject_depth_map_to_point_map
 with torch.no_grad():
     with torch.cuda.amp.autocast(dtype=dtype):
         images = images[None]  # add batch dimension
-        aggregated_tokens_list, ps_idx = model.aggregator(images)
+        aggregated_tokens_list, ps_idx, layer_indices = model.aggregator(images)
                 
     # Predict Cameras
-    pose_enc = model.camera_head(aggregated_tokens_list)[-1]
+    pose_enc = model.camera_head(aggregated_tokens_list, layer_indices=layer_indices)[-1]
     # Extrinsic and intrinsic matrices, following OpenCV convention (camera from world)
     extrinsic, intrinsic = pose_encoding_to_extri_intri(pose_enc, images.shape[-2:])
 
     # Predict Depth Maps
-    depth_map, depth_conf = model.depth_head(aggregated_tokens_list, images, ps_idx)
+    depth_map, depth_conf = model.depth_head(aggregated_tokens_list, images, ps_idx, layer_indices=layer_indices)
 
     # Predict Point Maps
-    point_map, point_conf = model.point_head(aggregated_tokens_list, images, ps_idx)
+    point_map, point_conf = model.point_head(aggregated_tokens_list, images, ps_idx, layer_indices=layer_indices)
         
     # Construct 3D Points from Depth Maps and Cameras
     # which usually leads to more accurate 3D points than point map branch
@@ -130,7 +130,13 @@ with torch.no_grad():
     # choose your own points to track, with shape (N, 2) for one scene
     query_points = torch.FloatTensor([[100.0, 200.0], 
                                         [60.72, 259.94]]).to(device)
-    track_list, vis_score, conf_score = model.track_head(aggregated_tokens_list, images, ps_idx, query_points=query_points[None])
+    track_list, vis_score, conf_score = model.track_head(
+        aggregated_tokens_list,
+        images,
+        ps_idx,
+        query_points=query_points[None],
+        layer_indices=layer_indices,
+    )
 ```
 
 

@@ -10,6 +10,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import List, Optional
 
 from vggt.layers import Mlp
 from vggt.layers.block import Block
@@ -70,13 +71,17 @@ class CameraHead(nn.Module):
         self.adaln_norm = nn.LayerNorm(dim_in, elementwise_affine=False, eps=1e-6)
         self.pose_branch = Mlp(in_features=dim_in, hidden_features=dim_in // 2, out_features=self.target_dim, drop=0)
 
-    def forward(self, aggregated_tokens_list: list, num_iterations: int = 4) -> list:
+    def forward(
+        self, aggregated_tokens_list: list, layer_indices: Optional[List[int]] = None, num_iterations: int = 4
+    ) -> list:
         """
         Forward pass to predict camera parameters.
 
         Args:
             aggregated_tokens_list (list): List of token tensors from the network;
                 the last tensor is used for prediction.
+            layer_indices (List[int], optional): Transformer layer ids that produced the tensors.
+                Present for API parity; not used because we always consume the latest tensor.
             num_iterations (int, optional): Number of iterative refinement steps. Defaults to 4.
 
         Returns:
